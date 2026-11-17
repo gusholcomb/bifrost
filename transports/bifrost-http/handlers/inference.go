@@ -160,6 +160,7 @@ var responsesParamsKnownFields = map[string]bool{
 	"fallbacks":              true,
 	"stream":                 true,
 	"background":             true,
+	"background_options":     true,
 	"conversation":           true,
 	"include":                true,
 	"instructions":           true,
