@@ -5532,6 +5532,13 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 		}
 
 		if len(content.Parts) > 0 {
+			if content.Role == "" {
+				if msg.Type != nil && *msg.Type == schemas.ResponsesMessageTypeFunctionCall {
+					content.Role = "model"
+				} else {
+					content.Role = "user"
+				}
+			}
 			contents = append(contents, content)
 		}
 	}
