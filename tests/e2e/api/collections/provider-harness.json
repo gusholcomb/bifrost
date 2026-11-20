@@ -187517,7 +187517,7 @@
     },
     {
       "name": "113. Vertex embedding usage and batch arity (#1587) (vertex-embedding-usage)",
-      "description": "Vertex serves embeddings from two endpoints and Bifrost picks between them by model name: gemini-embedding-2* goes to `:embedContent`, everything else to `:predict`. They report usage in different places, and only one of them was being read.\n\n`:embedContent` returns `usageMetadata.promptTokenCount`, but `GeminiEmbeddingResponse` - shared with the Gemini provider - had no field for it, so it was dropped at unmarshal: HTTP 200, `usage: null`, and a null cost in the logs (the live half of #1587). 113.A1 pins it. 113.A2 is the control on the other endpoint, where usage comes from per-embedding `statistics.tokenCount` instead - that branch must keep working, since both now run through the same converter.\n\n113.A3 pins the arity. `:embedContent` takes exactly one content, and Vertex offers no batch alternative for these models: `:batchEmbedContents` is 404 there, `contents[]` is rejected as an unknown field, and `:predict` answers FAILED_PRECONDITION - all verified against the live endpoint. So a batched request is a caller error and must stay a clean 400 rather than becoming a 500 or a silently truncated response. Note this is model-class specific: the same batched request to a `:predict` model returns one vector per input (53.C3). Run with FEATURE=vertex-embedding-usage.",
+      "description": "Vertex serves embeddings from two endpoints and Bifrost picks between them by model name: gemini-embedding-2* goes to `:embedContent`, everything else to `:predict`. They report usage in different places, and only one of them was being read.\n\n`:embedContent` returns `usageMetadata.promptTokenCount`, but `GeminiEmbeddingResponse` - shared with the Gemini provider - had no field for it, so it was dropped at unmarshal: HTTP 200, `usage: null`, and a null cost in the logs (the live half of #1587). 113.A1 pins it. 113.A2 is the control on the other endpoint, where usage comes from per-embedding `statistics.tokenCount` instead - that branch must keep working, since both now run through the same converter.\n\n113.A3 pins the batch path. `:embedContent` takes exactly one content, so a request with several inputs goes to `:batchEmbedContents` (`{\"requests\": [{\"content\": ...}]}`, no per-entry `model`), which Google enabled online for gemini-embedding-2 on Vertex in Nov 2026 (python-genai v3.4.0) - before that it was 404 and Bifrost answered a clean 400. It must return one vector per input, in order, with usage summed by Vertex. The `:predict` twin is 53.C3. Run with FEATURE=vertex-embedding-usage.",
       "item": [
         {
           "name": "113.A1 vertex/gemini-embedding-2-preview - :embedContent reports upstream usage - #1587",
@@ -187631,7 +187631,7 @@
           ]
         },
         {
-          "name": "113.A3 [EXPECT-4XX] vertex/gemini-embedding-2-preview - batch input is a clean 400 - #1587",
+          "name": "113.A3 vertex/gemini-embedding-2-preview - batch input returns one vector per input via :batchEmbedContents",
           "request": {
             "method": "POST",
             "header": [
@@ -187661,24 +187661,24 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "// Verified against the live endpoint: Vertex has no batch shape for this model class.",
-                  "//   :embedContent with contents[]  -> 400 Unknown name \"contents\"",
-                  "//   :batchEmbedContents            -> 404 (endpoint does not exist on Vertex)",
-                  "//   :predict (1 or 2 instances)    -> 400 FAILED_PRECONDITION",
-                  "// So the rejection belongs to the caller, and must be raised before the provider call rather",
-                  "// than surfacing as a 5xx or a response quietly covering only the first input. 53.C3 is the",
-                  "// contrast: the same batched request to a :predict model returns one vector per input.",
+                  "// Several inputs go to :batchEmbedContents (live on Vertex for gemini-embedding-2 since Nov 2026).",
+                  "// Before that the converter refused len(input) > 1 with a 400; this case was the pin for that refusal.",
                   "var body = pm.response.text() || '';",
-                  "pm.test('batch input is rejected with 400', function () {",
-                  "  pm.expect(pm.response.code, 'expected 400; body: ' + body.slice(0, 300)).to.eql(400);",
+                  "pm.test('batch input returns 200', function () {",
+                  "  pm.expect(pm.response.code, 'expected 200; body: ' + body.slice(0, 300)).to.eql(200);",
                   "});",
                   "var j; try { j = pm.response.json(); } catch (e) {",
                   "  pm.expect.fail('response was not JSON: ' + body.slice(0, 300)); return; }",
-                  "pm.test('the error explains the arity and no partial result came back', function () {",
-                  "  var message = ((j.error || {}).message) || '';",
-                  "  pm.expect(message.toLowerCase(), 'error does not explain the arity: ' + JSON.stringify(j).slice(0, 300))",
-                  "    .to.include('batch');",
-                  "  pm.expect((j.data || []).length, 'a vector came back alongside the rejection').to.eql(0);",
+                  "pm.test('one non-empty vector per input, in input order', function () {",
+                  "  var data = j.data || [];",
+                  "  pm.expect(data.length, 'expected 2 vectors: ' + body.slice(0, 300)).to.eql(2);",
+                  "  data.forEach(function (d, i) {",
+                  "    pm.expect(d.index, 'index of entry ' + i).to.eql(i);",
+                  "    pm.expect((d.embedding || []).length, 'vector ' + i + ' is empty').to.be.above(0);",
+                  "  });",
+                  "});",
+                  "pm.test('usage is reported for the batch', function () {",
+                  "  pm.expect(((j.usage || {}).prompt_tokens) || 0, 'usage missing: ' + JSON.stringify(j.usage)).to.be.above(0);",
                   "});"
                 ]
               }
@@ -350466,6 +350466,859 @@
             "method": "GET",
             "header": [],
             "url": "{{baseUrl}}/api/models/details?provider={{aliasListingProvider}}&unfiltered=true&include_aliases=true&limit=50"
+          }
+        }
+      ]
+    },
+    {
+      "name": "385. Roleless Responses input items get a Gemini role (roleless items)",
+      "description": "Codex multi-agent v2 injects a subagent's reply as {\"type\":\"agent_message\",\"content\":[{\"type\":\"input_text\",...}]} with no role, and its function_call items carry no role either. The Gemini Responses converter only set Content.role from msg.role, so both went upstream with role \"\" and Vertex answered 400 \"Please use a valid role: user, model.\" A roleless function_call now becomes role model and any other roleless item role user. Each case replays a spawn_agent call, its output and the agent_message, and expects a completed answer.",
+      "item": [
+        {
+          "name": "vertex/gemini-4-argon /v1/responses: roleless agent_message and function_call items get a Gemini role (roleless items)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"vertex/gemini-4-argon\",\n  \"input\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"Spawn a subagent to count the TODOs, then tell me what it found in one sentence.\"\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"call_id\": \"call_spawn_1\",\n      \"name\": \"spawn_agent\",\n      \"arguments\": \"{\\\"task\\\":\\\"count TODOs\\\"}\"\n    },\n    {\n      \"type\": \"function_call_output\",\n      \"call_id\": \"call_spawn_1\",\n      \"output\": \"agent started\"\n    },\n    {\n      \"type\": \"agent_message\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"Subagent result: found 3 TODOs in core/bifrost.go.\"\n        }\n      ]\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"name\": \"spawn_agent\",\n      \"description\": \"Spawn a subagent for a task\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"task\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"task\"\n        ]\n      }\n    }\n  ],\n  \"tool_choice\": \"none\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('385 vertex/gemini-4-argon /v1/responses: 200, not a \"valid role: user, model\" 400', function () {",
+                  "  pm.expect(pm.response.code, 'want 200: ' + txt.slice(0, 1500)).to.eql(200);",
+                  "  pm.expect(txt, 'roleless content reached the provider: ' + txt.slice(0, 1500)).to.not.include('valid role');",
+                  "});",
+                  "var body = {}; try { body = pm.response.json(); } catch (e) {}",
+                  "pm.test('385 vertex/gemini-4-argon /v1/responses: completed with assistant text', function () {",
+                  "  pm.expect(body.status, 'status: ' + txt.slice(0, 1500)).to.eql('completed');",
+                  "  var texts = (body.output || []).filter(function (o) { return o.type === 'message'; }).map(function (o) { return (o.content || []).map(function (c) { return c.text || ''; }).join(''); }).join('');",
+                  "  pm.expect(texts, 'no assistant text: ' + txt.slice(0, 1500)).to.be.a('string').that.is.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "vertex/gemini-4-argon /openai/v1/responses: roleless agent_message and function_call items get a Gemini role (roleless items)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/openai/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openai",
+                "v1",
+                "responses"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"vertex/gemini-4-argon\",\n  \"input\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"Spawn a subagent to count the TODOs, then tell me what it found in one sentence.\"\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"call_id\": \"call_spawn_1\",\n      \"name\": \"spawn_agent\",\n      \"arguments\": \"{\\\"task\\\":\\\"count TODOs\\\"}\"\n    },\n    {\n      \"type\": \"function_call_output\",\n      \"call_id\": \"call_spawn_1\",\n      \"output\": \"agent started\"\n    },\n    {\n      \"type\": \"agent_message\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"Subagent result: found 3 TODOs in core/bifrost.go.\"\n        }\n      ]\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"name\": \"spawn_agent\",\n      \"description\": \"Spawn a subagent for a task\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"task\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"task\"\n        ]\n      }\n    }\n  ],\n  \"tool_choice\": \"none\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('385 vertex/gemini-4-argon /openai/v1/responses: 200, not a \"valid role: user, model\" 400', function () {",
+                  "  pm.expect(pm.response.code, 'want 200: ' + txt.slice(0, 1500)).to.eql(200);",
+                  "  pm.expect(txt, 'roleless content reached the provider: ' + txt.slice(0, 1500)).to.not.include('valid role');",
+                  "});",
+                  "var body = {}; try { body = pm.response.json(); } catch (e) {}",
+                  "pm.test('385 vertex/gemini-4-argon /openai/v1/responses: completed with assistant text', function () {",
+                  "  pm.expect(body.status, 'status: ' + txt.slice(0, 1500)).to.eql('completed');",
+                  "  var texts = (body.output || []).filter(function (o) { return o.type === 'message'; }).map(function (o) { return (o.content || []).map(function (c) { return c.text || ''; }).join(''); }).join('');",
+                  "  pm.expect(texts, 'no assistant text: ' + txt.slice(0, 1500)).to.be.a('string').that.is.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "gemini/gemini-2.5-flash /v1/responses: roleless agent_message and function_call items get a Gemini role (roleless items)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gemini/gemini-2.5-flash\",\n  \"input\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"Spawn a subagent to count the TODOs, then tell me what it found in one sentence.\"\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"call_id\": \"call_spawn_1\",\n      \"name\": \"spawn_agent\",\n      \"arguments\": \"{\\\"task\\\":\\\"count TODOs\\\"}\"\n    },\n    {\n      \"type\": \"function_call_output\",\n      \"call_id\": \"call_spawn_1\",\n      \"output\": \"agent started\"\n    },\n    {\n      \"type\": \"agent_message\",\n      \"content\": [\n        {\n          \"type\": \"input_text\",\n          \"text\": \"Subagent result: found 3 TODOs in core/bifrost.go.\"\n        }\n      ]\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"name\": \"spawn_agent\",\n      \"description\": \"Spawn a subagent for a task\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"task\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"task\"\n        ]\n      }\n    }\n  ],\n  \"tool_choice\": \"none\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('385 gemini/gemini-2.5-flash /v1/responses: 200, not a \"valid role: user, model\" 400', function () {",
+                  "  pm.expect(pm.response.code, 'want 200: ' + txt.slice(0, 1500)).to.eql(200);",
+                  "  pm.expect(txt, 'roleless content reached the provider: ' + txt.slice(0, 1500)).to.not.include('valid role');",
+                  "});",
+                  "var body = {}; try { body = pm.response.json(); } catch (e) {}",
+                  "pm.test('385 gemini/gemini-2.5-flash /v1/responses: completed with assistant text', function () {",
+                  "  pm.expect(body.status, 'status: ' + txt.slice(0, 1500)).to.eql('completed');",
+                  "  var texts = (body.output || []).filter(function (o) { return o.type === 'message'; }).map(function (o) { return (o.content || []).map(function (c) { return c.text || ''; }).join(''); }).join('');",
+                  "  pm.expect(texts, 'no assistant text: ' + txt.slice(0, 1500)).to.be.a('string').that.is.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "386. Server tool models are checked only where an advisor runs (advisor without a host) [SERIAL]",
+      "description": "Governance holds the model an advisor tool names to the virtual key's model list, because the provider runs that model inside the same request. It checked the advisor model against the request's own provider whatever that provider was, so a request for an OpenAI model that carried an advisor tool naming a Claude model was refused with model_blocked: OpenAI does not serve that model, so no key could allow it there. Claude Code sends the advisor tool on every request, including for non-Claude models, which made every such request fail with 403. Only a host that serves the advisor tool runs the model it names; on any other provider the typed tool is dropped before the provider call and a tool forwarded as written is rejected by the provider. Governance now skips the advisor model check there. Setup creates a run-scoped virtual key that allows only gpt-4o-mini on OpenAI. Red before the change: every row returned 403 naming claude-opus-4-8. Routes: the native /anthropic/v1/messages route a Claude Code client uses (unary and streaming) and the neutral /v1/responses route, which are served; and the /openai/v1/chat/completions and /openai/v1/responses routes with x-bf-passthrough-extra-params, where the tool reaches OpenAI as written and the reply is OpenAI's own 400. The refusal on a host that does run an advisor is pinned by folder 277. Not covered here: raw forwarding and passthrough bodies (pinned by governance unit tests).",
+      "item": [
+        {
+          "name": "openai advisor without a host setup: create a virtual key that allows only gpt-4o-mini",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Sweep virtual keys an earlier run left behind (a failed cleanup or an aborted run). The folder is",
+                  "// [SERIAL], so it runs whole and once per run: every run-tagged key that exists now is a leftover.",
+                  "(function () {",
+                  "  var BASE = pm.variables.get('baseUrl');",
+                  "  var PREFIX = 'harness-nah-vk-run-';",
+                  "  pm.sendRequest({ url: BASE + '/api/governance/virtual-keys?search=' + encodeURIComponent(PREFIX) + '&limit=100', method: 'GET' }, function (err, res) {",
+                  "    var json = null; try { json = res.json(); } catch (e) { json = null; }",
+                  "    ((json && json.virtual_keys) || []).filter(function (v) { return String(v.name || '').indexOf(PREFIX) === 0; }).forEach(function (v) {",
+                  "      pm.sendRequest({ url: BASE + '/api/governance/virtual-keys/' + v.id, method: 'DELETE' }, function () {});",
+                  "    });",
+                  "  });",
+                  "})();",
+                  "pm.collectionVariables.set('nahVK', 'missing');",
+                  "pm.collectionVariables.unset('nahVKID');",
+                  "pm.collectionVariables.set('nahBody', JSON.stringify({",
+                  "  name: 'harness-nah-vk-run-' + Date.now(),",
+                  "  provider_configs: [{ provider: 'openai', allowed_models: ['gpt-4o-mini'], key_ids: ['*'], weight: 1 }]",
+                  "}));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('advisor without a host: virtual key created', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + pm.response.text()).to.eql(200);",
+                  "});",
+                  "var vk = {}; try { vk = (pm.response.json() || {}).virtual_key || {}; } catch (e) { vk = {}; }",
+                  "var value = (vk.value && typeof vk.value === 'object') ? vk.value.value : vk.value;",
+                  "pm.test('advisor without a host: the virtual key has a value and an id', function () {",
+                  "  pm.expect(value, pm.response.text()).to.be.a('string').and.not.equal('');",
+                  "  pm.expect(vk.id, pm.response.text()).to.be.a('string').and.not.equal('');",
+                  "});",
+                  "if (value && vk.id) { pm.collectionVariables.set('nahVK', value); pm.collectionVariables.set('nahVKID', vk.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{nahBody}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/governance/virtual-keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "governance",
+                "virtual-keys"
+              ]
+            }
+          }
+        },
+        {
+          "name": "openai gpt-4o-mini /anthropic/v1/messages: an advisor tool naming claude-opus-4-8 is dropped and the request is served - advisor without a host",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// OpenAI runs no advisor: the gateway drops the tool before the provider call, so claude-opus-4-8",
+                  "// never runs and the key's model list has nothing to refuse. The key allows only gpt-4o-mini.",
+                  "pm.test('anthropic messages: served with 200', function () {",
+                  "  pm.expect(pm.response.code, 'want 200: ' + txt.slice(0, 600)).to.eql(200);",
+                  "});",
+                  "pm.test('anthropic messages: no model refusal for the advisor model', function () {",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('model_blocked');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('permission_error');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('is not allowed for virtual key');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-api-key",
+                "value": "{{nahVK}}"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{nahVK}}"
+              },
+              {
+                "key": "anthropic-version",
+                "value": "2023-06-01"
+              },
+              {
+                "key": "anthropic-beta",
+                "value": "advisor-tool-2026-03-01"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"max_tokens\": 16,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"advisor_20260301\",\n      \"name\": \"advisor\",\n      \"model\": \"claude-opus-4-8\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "anthropic",
+                "v1",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "openai gpt-4o-mini /anthropic/v1/messages stream: an advisor tool naming claude-opus-4-8 is dropped and the stream is served - advisor without a host",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// OpenAI runs no advisor: the gateway drops the tool before the provider call, so claude-opus-4-8",
+                  "// never runs and the key's model list has nothing to refuse. The key allows only gpt-4o-mini.",
+                  "pm.test('anthropic messages stream: served with 200', function () {",
+                  "  pm.expect(pm.response.code, 'want 200: ' + txt.slice(0, 600)).to.eql(200);",
+                  "});",
+                  "pm.test('anthropic messages stream: no model refusal for the advisor model', function () {",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('model_blocked');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('permission_error');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('is not allowed for virtual key');",
+                  "});",
+                  "pm.test('anthropic messages stream: the stream completes', function () {",
+                  "  pm.expect(txt, txt.slice(-600)).to.include('event: message_stop');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-api-key",
+                "value": "{{nahVK}}"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{nahVK}}"
+              },
+              {
+                "key": "anthropic-version",
+                "value": "2023-06-01"
+              },
+              {
+                "key": "anthropic-beta",
+                "value": "advisor-tool-2026-03-01"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"max_tokens\": 16,\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"advisor_20260301\",\n      \"name\": \"advisor\",\n      \"model\": \"claude-opus-4-8\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "anthropic",
+                "v1",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "openai/gpt-4o-mini /v1/responses: an advisor tool naming claude-opus-4-8 is dropped and the request is served - advisor without a host",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// OpenAI runs no advisor: the gateway drops the tool before the provider call, so claude-opus-4-8",
+                  "// never runs and the key's model list has nothing to refuse. The key allows only gpt-4o-mini.",
+                  "pm.test('responses: served with 200', function () {",
+                  "  pm.expect(pm.response.code, 'want 200: ' + txt.slice(0, 600)).to.eql(200);",
+                  "});",
+                  "pm.test('responses: no model refusal for the advisor model', function () {",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('model_blocked');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('permission_error');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('is not allowed for virtual key');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{nahVK}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"max_output_tokens\": 16,\n  \"input\": \"Reply with the single word: ok\",\n  \"tools\": [\n    {\n      \"type\": \"advisor\",\n      \"model\": \"claude-opus-4-8\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "[EXPECT-400] openai/gpt-4o-mini /openai/v1/chat/completions extra_params: an advisor tool in extra_params.tools reaches OpenAI and is rejected there, not by the model list - advisor without a host",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// extra_params.tools is merged onto the provider body as written, so OpenAI receives the advisor",
+                  "// tool and rejects its type. That is the provider's own 400: no second model ran, so governance",
+                  "// has nothing to refuse and must not answer 403 first.",
+                  "pm.test('chat extra_params: the provider rejects the tool with 400', function () {",
+                  "  pm.expect(pm.response.code, 'want the provider 400: ' + txt.slice(0, 600)).to.eql(400);",
+                  "});",
+                  "pm.test('chat extra_params: the error comes from the provider, not from the model list', function () {",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.include('advisor_20260301');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('model_blocked');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('is not allowed for virtual key');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{nahVK}}"
+              },
+              {
+                "key": "x-bf-passthrough-extra-params",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"max_tokens\": 16,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"extra_params\": {\n    \"tools\": [\n      {\n        \"type\": \"advisor_20260301\",\n        \"name\": \"advisor\",\n        \"model\": \"claude-opus-4-8\"\n      }\n    ]\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/openai/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openai",
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "[EXPECT-400] openai/gpt-4o-mini /openai/v1/responses extra_params: an advisor tool in extra_params.tools reaches OpenAI and is rejected there, not by the model list - advisor without a host",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// extra_params.tools is merged onto the provider body as written, so OpenAI receives the advisor",
+                  "// tool and rejects its type. That is the provider's own 400: no second model ran, so governance",
+                  "// has nothing to refuse and must not answer 403 first.",
+                  "pm.test('responses extra_params: the provider rejects the tool with 400', function () {",
+                  "  pm.expect(pm.response.code, 'want the provider 400: ' + txt.slice(0, 600)).to.eql(400);",
+                  "});",
+                  "pm.test('responses extra_params: the error comes from the provider, not from the model list', function () {",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.include('advisor_20260301');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('model_blocked');",
+                  "  pm.expect(txt, txt.slice(0, 600)).to.not.include('is not allowed for virtual key');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{nahVK}}"
+              },
+              {
+                "key": "x-bf-passthrough-extra-params",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"max_output_tokens\": 16,\n  \"input\": \"Reply with the single word: ok\",\n  \"extra_params\": {\n    \"tools\": [\n      {\n        \"type\": \"advisor_20260301\",\n        \"name\": \"advisor\",\n        \"model\": \"claude-opus-4-8\"\n      }\n    ]\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/openai/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openai",
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "openai advisor without a host cleanup: delete the virtual key",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Nothing was created, so there is nothing to delete.",
+                  "if (!pm.collectionVariables.get('nahVKID')) { pm.execution.skipRequest(); return; }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('advisor without a host: virtual key deleted', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + pm.response.text()).to.eql(200);",
+                  "});",
+                  "// Keep the id when the delete failed, so the failure stays visible and the next run's sweep removes the key.",
+                  "if (pm.response.code === 200) { pm.collectionVariables.unset('nahVKID'); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/governance/virtual-keys/{{nahVKID}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "governance",
+                "virtual-keys",
+                "{{nahVKID}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "387. prewarm and background_options reach OpenAI as typed params (prewarm and background options)",
+      "description": "OpenAI's Responses API takes prompt_cache_options.prewarm (write the prompt cache without generating output), prompt_cache_options.comparison_response_id (cache diagnostics) and background_options {completion_window: soonest|2h|8h, continuation_id} (discounted background windows on gpt-6.2-astra, gpt-6.2-sol, gpt-6.1-terra and gpt-6-luna).\n\nBefore the fix the typed PromptCacheOptions held only mode and ttl, so prewarm was dropped at decode on every route and a cache-warming request became a billed generation. background_options was not a typed Responses parameter: /openai/v1/responses dropped it at decode, and /v1/responses carried it in extra params, which reach the provider only behind x-bf-passthrough-extra-params.\n\nNo case here sends the passthrough header. The prewarm cases expect 200 and check raw_request for the two fields. The background cases pin the same thing two ways: a valid soonest window with a continuation id is forwarded intact, and an invalid window is rejected by OpenAI with a 4xx that names completion_window, where a dropped field would have returned 200.",
+      "item": [
+        {
+          "name": "387.1 openai gpt-6.2-sol /v1/responses: prompt_cache_options.prewarm and comparison_response_id reach OpenAI - prewarm and background options",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A prefix long enough to be cacheable, so the prewarm has something to write.",
+                  "pm.variables.set('prewarmPrefix', new Array(151).join('The gateway forwards prewarm requests unchanged. '));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('387.1 status 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + pm.response.text()).to.equal(200);",
+                  "});",
+                  "if (pm.response.code !== 200) { return; }",
+                  "var body = pm.response.json() || {};",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('387.1 raw_request captured', function () {",
+                  "  pm.expect(rr, 'x-bf-send-back-raw-request not honored: ' + pm.response.text().slice(0, 300)).to.be.an('object');",
+                  "});",
+                  "if (!rr) { return; }",
+                  "var rawStr = JSON.stringify(rr);",
+                  "pm.test('387.1 outbound body carries prompt_cache_options.prewarm', function () {",
+                  "  pm.expect((rr.prompt_cache_options || {}).prewarm, 'raw_request: ' + rawStr.slice(0, 800)).to.equal(true);",
+                  "});",
+                  "pm.test('387.1 outbound body carries prompt_cache_options.comparison_response_id', function () {",
+                  "  pm.expect((rr.prompt_cache_options || {}).comparison_response_id, 'raw_request: ' + rawStr.slice(0, 800)).to.equal('resp_harness_missing');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.2-sol\",\n  \"max_output_tokens\": 16,\n  \"prompt_cache_options\": {\n    \"prewarm\": true,\n    \"comparison_response_id\": \"resp_harness_missing\"\n  },\n  \"input\": [\n    {\n      \"role\": \"developer\",\n      \"content\": \"{{prewarmPrefix}}\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with OK.\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "387.2 openai gpt-6.2-sol /openai/v1/responses: prompt_cache_options.prewarm and comparison_response_id reach OpenAI - prewarm and background options",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A prefix long enough to be cacheable, so the prewarm has something to write.",
+                  "pm.variables.set('prewarmPrefix', new Array(151).join('The gateway forwards prewarm requests unchanged. '));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('387.2 status 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + pm.response.text()).to.equal(200);",
+                  "});",
+                  "if (pm.response.code !== 200) { return; }",
+                  "var body = pm.response.json() || {};",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('387.2 raw_request captured', function () {",
+                  "  pm.expect(rr, 'x-bf-send-back-raw-request not honored: ' + pm.response.text().slice(0, 300)).to.be.an('object');",
+                  "});",
+                  "if (!rr) { return; }",
+                  "var rawStr = JSON.stringify(rr);",
+                  "pm.test('387.2 outbound body carries prompt_cache_options.prewarm', function () {",
+                  "  pm.expect((rr.prompt_cache_options || {}).prewarm, 'raw_request: ' + rawStr.slice(0, 800)).to.equal(true);",
+                  "});",
+                  "pm.test('387.2 outbound body carries prompt_cache_options.comparison_response_id', function () {",
+                  "  pm.expect((rr.prompt_cache_options || {}).comparison_response_id, 'raw_request: ' + rawStr.slice(0, 800)).to.equal('resp_harness_missing');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.2-sol\",\n  \"max_output_tokens\": 16,\n  \"prompt_cache_options\": {\n    \"prewarm\": true,\n    \"comparison_response_id\": \"resp_harness_missing\"\n  },\n  \"input\": [\n    {\n      \"role\": \"developer\",\n      \"content\": \"{{prewarmPrefix}}\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with OK.\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/openai/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openai",
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "387.3 openai gpt-6.2-sol /v1/responses: background_options forwarded with its continuation id - prewarm and background options",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('387.3 status 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + pm.response.text()).to.equal(200);",
+                  "});",
+                  "if (pm.response.code !== 200) { return; }",
+                  "var body = pm.response.json() || {};",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('387.3 raw_request captured', function () {",
+                  "  pm.expect(rr, 'x-bf-send-back-raw-request not honored: ' + pm.response.text().slice(0, 300)).to.be.an('object');",
+                  "});",
+                  "if (!rr) { return; }",
+                  "var rawStr = JSON.stringify(rr);",
+                  "pm.test('387.3 outbound body carries background_options.completion_window', function () {",
+                  "  pm.expect((rr.background_options || {}).completion_window, 'raw_request: ' + rawStr.slice(0, 800)).to.equal('soonest');",
+                  "});",
+                  "pm.test('387.3 outbound body carries background_options.continuation_id', function () {",
+                  "  pm.expect((rr.background_options || {}).continuation_id, 'raw_request: ' + rawStr.slice(0, 800)).to.equal('harness-run-1');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.2-sol\",\n  \"max_output_tokens\": 16,\n  \"background\": true,\n  \"background_options\": {\n    \"completion_window\": \"soonest\",\n    \"continuation_id\": \"harness-run-1\"\n  },\n  \"input\": \"Reply with OK.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "387.4 [EXPECT-4XX] openai gpt-6.2-sol /v1/responses: invalid background_options.completion_window is rejected by OpenAI, not dropped - prewarm and background options",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('387.4 upstream names completion_window in the rejection', function () {",
+                  "  pm.expect(pm.response.text(), 'rejection does not mention completion_window; background_options may not have reached the provider: ' + pm.response.text()).to.match(/completion_window/i);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.2-sol\",\n  \"max_output_tokens\": 16,\n  \"background\": true,\n  \"background_options\": {\n    \"completion_window\": \"1h\",\n    \"continuation_id\": \"harness-run-1\"\n  },\n  \"input\": \"Reply with OK.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "387.5 [EXPECT-4XX] openai gpt-6.2-sol /openai/v1/responses: invalid background_options.completion_window is rejected by OpenAI, not dropped - prewarm and background options",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('387.5 upstream names completion_window in the rejection', function () {",
+                  "  pm.expect(pm.response.text(), 'rejection does not mention completion_window; background_options may not have reached the provider: ' + pm.response.text()).to.match(/completion_window/i);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.2-sol\",\n  \"max_output_tokens\": 16,\n  \"background\": true,\n  \"background_options\": {\n    \"completion_window\": \"1h\",\n    \"continuation_id\": \"harness-run-1\"\n  },\n  \"input\": \"Reply with OK.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/openai/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openai",
+                "v1",
+                "responses"
+              ]
+            }
           }
         }
       ]
