@@ -399,6 +399,48 @@ func TestRefreshRotationExpiryAndRevocation(t *testing.T) {
 	}
 }
 
+// TestRevokeOnReuseEndsTheGrant: with revoke_on_reuse, presenting a rotated-away
+// refresh token revokes the whole grant, so the current refresh token and access
+// token stop working too.
+func TestRevokeOnReuseEndsTheGrant(t *testing.T) {
+	fleet, srv := oauthFleet(t, map[string]any{
+		"rotate_refresh":  true,
+		"revoke_on_reuse": true,
+		"clients":         []any{map[string]any{"client_id": "c1", "client_secret": "s1"}},
+	})
+	code, verifier := codeFor(t, fleet, "dana")
+	first := exchange(t, fleet, code, verifier)
+	refresh := func(rt string) (int, map[string]any) {
+		return token(t, fleet, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {rt},
+			"client_id": {"c1"}, "client_secret": {"s1"}})
+	}
+	status, second := refresh(first["refresh_token"].(string))
+	if status != http.StatusOK {
+		t.Fatalf("expected the first refresh to rotate, got %d %v", status, second)
+	}
+
+	status, out := refresh(first["refresh_token"].(string))
+	if status != http.StatusBadRequest || out["error_description"] != "retired refresh token reused; grant revoked" {
+		t.Fatalf("expected the reused refresh token to revoke the grant, got %d %v", status, out)
+	}
+	if status, out := refresh(second["refresh_token"].(string)); status != http.StatusBadRequest || out["error_description"] != "refresh token revoked" {
+		t.Errorf("the current refresh token must die with the grant, got %d %v", status, out)
+	}
+	if status, _ := mcpStatus(t, fleet, second["access_token"].(string)); status != http.StatusUnauthorized {
+		t.Errorf("the current access token must die with the grant, got %d", status)
+	}
+	state := srv.State().OAuth
+	if state.Counters.ReuseRevocations != 1 || len(state.Grants) != 1 || !state.Grants[0].Revoked {
+		t.Errorf("expected one grant revoked by reuse, got counters %+v grants %+v", state.Counters, state.Grants)
+	}
+
+	// Without rotation there is nothing to reuse, so the setting is refused.
+	resp, _ := post(t, fleet.URL()+"/control/alpha/auth", map[string]any{"auth": map[string]any{"oauth": map[string]any{"revoke_on_reuse": true}}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected revoke_on_reuse without rotate_refresh to be refused, got %d", resp.StatusCode)
+	}
+}
+
 // TestForgetDropsDynamicClientsAndTheirGrants: oauth/forget stands in for an
 // authorization server that stops recognising the clients it registered. The
 // forgotten client is unknown at authorize and its grants end; a client
